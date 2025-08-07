@@ -1,13 +1,16 @@
-#include "miniz.h"
+#include "tinf.h"
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <string>
+#include <string_view>
 
 namespace fs = std::filesystem;
 using ios = std::ios;
 
-#define SNES_WRAM_OFFSET 0x23F
+#define MESEN2_WRAM_OFFSET 0x23F
 
 template<typename... T> inline bool err(T... what)
 {
@@ -36,13 +39,12 @@ bool read_savestate(std::string * path)
         return err("Couldn't open savestate ", path->c_str());
 
     uint8_t * ram_page_2 = new uint8_t[0x10000] {};
+    uint32_t read_double;
 
     char head[4];
     savestate.get(head, 4);
     if(std::strcmp(head, "MSS") == 0)
     {
-        uint32_t read_double;
-
         // Expect Mesen 2 savestate
         read_double = savestate.get() | (savestate.get()<<8) | (savestate.get()<<16) | (savestate.get()<<24);
         if(read_double<(2<<16))
@@ -63,27 +65,65 @@ bool read_savestate(std::string * path)
 
         read_double = savestate.get() | (savestate.get()<<8) | (savestate.get()<<16) | (savestate.get()<<24);
         uint8_t * uncompressed_data = new uint8_t[read_double];
-        unsigned long uncompressed_size = read_double;
+        unsigned int uncompressed_size = read_double;
 
         read_double = savestate.get() | (savestate.get()<<8) | (savestate.get()<<16) | (savestate.get()<<24);
         char * compressed_data = new char[read_double];
         savestate.read(compressed_data, read_double);
-        unsigned long compressed_size = read_double;
+        unsigned int compressed_size = read_double;
 
-        if( uncompress(uncompressed_data, &uncompressed_size, (const unsigned char *)(compressed_data), compressed_size) != MZ_OK )
-            return err("An error ocurred decompressing data from this Mesen 2 save.");
+        if( tinf_zlib_uncompress(uncompressed_data, &uncompressed_size, compressed_data, compressed_size) != TINF_OK )
+            return err("An error ocurred decompressing data from this Mesen 2 savestate.");
 
         // Work RAM
-        if(uncompressed_data[SNES_WRAM_OFFSET] != 0x00)
+        if(uncompressed_data[MESEN2_WRAM_OFFSET] != 0x00)
             return err("Expected uncompressed RAM. How exactly are you generating this savestate?");
 
-        read_double = uncompressed_data[SNES_WRAM_OFFSET+1] | (uncompressed_data[SNES_WRAM_OFFSET+2]<<8) |\
-                      ( uncompressed_data[SNES_WRAM_OFFSET+3]<<16 ) | ( uncompressed_data[SNES_WRAM_OFFSET+4]<<24 );
+        read_double = uncompressed_data[MESEN2_WRAM_OFFSET+1] | (uncompressed_data[MESEN2_WRAM_OFFSET+2]<<8) |\
+                      ( uncompressed_data[MESEN2_WRAM_OFFSET+3]<<16 ) | ( uncompressed_data[MESEN2_WRAM_OFFSET+4]<<24 );
         if(read_double!=0x00020000)
             return err("Expected a memory dump of 128KiB. Are you sure this is a SNES save?");
 
         // LM stores the controller input info starting at $7F0000
-        memcpy(ram_page_2, &(uncompressed_data[0x10000+SNES_WRAM_OFFSET+5]), 0x10000);
+        memcpy(ram_page_2, &(uncompressed_data[0x10000+MESEN2_WRAM_OFFSET+5]), 0x10000);
+    }
+    else if( ( ( ((uint8_t)(head[0]))<<8 ) | (uint8_t)(head[1]) ) == 0x1F8B )
+    {
+        // Expect gzip-compressed (snes9x 1.52+ most likely) savestate
+        savestate.seekg(0, ios::end);
+        unsigned int compressed_size = savestate.tellg();
+        char * compressed_data = new char[compressed_size];
+
+        savestate.seekg(0);
+        savestate.read(compressed_data, compressed_size);
+
+        // A savestate is not going to be 4GiB uncompressed so let's just take the value as is
+        savestate.seekg(compressed_size-4, ios::beg);
+        read_double = savestate.get() | (savestate.get()<<8) | (savestate.get()<<16) | (savestate.get()<<24);
+        uint8_t * uncompressed_data = new uint8_t[read_double];
+        unsigned int uncompressed_size = read_double;
+
+        if( tinf_gzip_uncompress(uncompressed_data, &uncompressed_size, compressed_data, compressed_size) != TINF_OK )
+            return err("An error ocurred decompressing data from a gzip-compressed savestate.");
+
+        // snes9x magic string
+        std::string signature((const char *)(uncompressed_data), 8);
+        if(std::strcmp(signature.c_str(), "#!s9xsnp") != 0)
+            return err("Expected a snes9x savestate.");
+
+        // Find RAM string
+        std::string_view uncompressed_data_sv { (const char *)(uncompressed_data), uncompressed_size };
+        std::string_view ram_header { "RAM:131072", 10 };
+        const std::boyer_moore_searcher s(ram_header.begin(), ram_header.end());
+        const auto it = std::search(uncompressed_data_sv.begin(), uncompressed_data_sv.end(), s);
+
+        if(it == uncompressed_data_sv.end())
+            return err("Couldn't find where the RAM data begins in this snes9x savestate. What version are you using?");
+
+        const auto ram_off = std::distance(uncompressed_data_sv.begin(), it);
+
+        // LM stores the controller input info starting at $7F0000
+        memcpy(ram_page_2, &(uncompressed_data[0x10000+ram_off+11]), 0x10000);
     }
 
     // 0xFF = end data
