@@ -16,6 +16,14 @@ template<typename... T> inline bool err(T... what)
 {
     std::cout << "ERROR: " ;
     ( (std::cout << what), ...);
+
+    #if defined(_WIN32)
+        std::system("pause");
+    #else
+        printf("Press Enter to continue");
+        getchar();
+    #endif
+
     return false;
 }
 
@@ -31,7 +39,8 @@ void cleanup_str(std::string* str)
 bool read_savestate(std::string * path)
 {
     cleanup_str(path);
-    std::ifstream savestate(fs::absolute(*path), ios::binary);
+    std::string abs_path = fs::absolute(*path).string();
+    std::ifstream savestate(abs_path, ios::binary);
 
     const char * e = path->c_str();
 
@@ -131,7 +140,22 @@ bool read_savestate(std::string * path)
     {
         if(ram_page_2[i] == 0xFF)
         {
-            std::ofstream("./raw.bin", ios::binary).write((const char *)(ram_page_2), i+1);
+            #ifdef _WIN32
+                std::string out_path(abs_path.begin(), abs_path.begin()+abs_path.find_last_of("\\")+1);
+            #else
+                std::string out_path(abs_path.begin(), abs_path.begin()+abs_path.find_last_of("/")+1);
+            #endif
+            std::ofstream(out_path+"titlescreen_move_data.bin", ios::binary).write((const char *)(ram_page_2), i+1);
+
+            std::cout << "Success!" << std::endl << "Saved titlescreen recording data to file " << out_path << "titlescreen_move_data.bin" << std::endl;
+
+            #if defined(_WIN32)
+                std::system("pause");
+            #else
+                printf("Press Enter to continue");
+                getchar();
+            #endif
+
             return true;
         }
         if(i+1==0x10000)
